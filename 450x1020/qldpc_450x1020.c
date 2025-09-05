@@ -1,0 +1,241 @@
+#include <stdint.h>
+#include <stdlib.h>
+#include <math.h>
+#include "runtime.h"
+#include "LP_1020_450_10.h"
+#include "LP_1020_450_10_logic.h"
+
+#ifdef SPIKE
+#include <stdio.h>
+#elif defined ARA_LINUX
+#include <stdio.h>
+#else
+#include "printf.h"
+#endif
+
+#define MIN 1000.0f 
+
+uint8_t qldcp_minsum(int32_t n_iterations, float* L, float alpha, int32_t S[M], int32_t est_error[N], int32_t* it) {
+
+    int32_t i, j, ip, jp, hard_decision, sign, parity;
+    float sum, sumv[N], temp[N], min, R_abs, x;
+    int32_t check[M] = {0};
+
+    float R[450 * 8] = {0};
+    float R_aux[450 * 8] = {0};
+
+    float o[1020 * 5] = {0};
+    float o_aux[1020 * 5] = {0};
+
+    uint8_t corrected = 0;
+    
+    int64_t runtime = 0;
+
+    /************************************************************************************************************** */
+
+    while(*it < n_iterations && !corrected) {
+    
+        start_timer();
+
+        asm volatile (".word 0xDEADBEEF # FLAG");
+      
+        //mu[i,j] = min(R[i.j']) x mul HD(R[i,j']) xor S[i]
+        for(i = 0; i < M; i++) {
+            for(j = 0; j < 8; j++) {     //h_lengths en h son siempre 8
+                
+                min = MIN;
+                parity = S[i];
+
+                //PARALELIZABLE
+                //En el mismo bucle buscamos el minimo y el signo
+                for (jp = 0; jp < 8; jp++) {    //h_lengths en h son siempre 8
+                    if(j != jp) {
+                        R_abs = fabs(R[i * 8 + jp]);
+                        if(R_abs < min){
+                            min = R_abs;
+                        }
+                         
+                        //Paridad, 1 si es negativo y 0 si es positivo
+                        hard_decision = (R[i * 8 + jp] < 0) ? 1 : 0;
+                        parity ^= hard_decision;
+                    }
+                }
+                //Le añadimos el signo segun la paridad
+                sign = (parity == 0) ? 1 : -1;
+                R_aux[i * 8 + j] = min * sign;
+            }
+        }
+
+        asm volatile (".word 0xDEADBEEF # FLAG");
+        
+        
+        for (i = 0; i < M; i++) {
+            for (j = 0; j < 8; j++) {
+                o[h_indices[i][j] * 5 + h_to_ht[i][j]] = R_aux[i * 8 + j];
+            }
+        }        
+        
+        stop_timer();
+        runtime = get_timer();
+        printf("Loop 1: %ld ciclos\n", runtime);
+        
+        /************** LOOP 2 **************/
+        start_timer();
+
+        //R[i,j] = L[j] + a * sum (mu[i'][j])
+        for(j = 0; j < N; j++) {
+        
+            sum = 0;
+            for(i = 0; i < 5; i++) {
+                sum += o[j * 5 + i];  
+            }
+            
+            sumv[j] = sum;
+            
+            for(i = 0; i < 5; i++) {
+                o_aux[j * 5 + i] = L[j] + alpha * (sum - o[j * 5 + i]);
+            }
+  
+        }
+        
+        for (j = 0; j < N; j++) {
+            for (i = 0; i < 5; i++) {
+                R[ht_indices[j][i] * 8 + ht_to_h[j][i]] = o_aux[j * 5 + i];
+            }
+        }
+        
+        stop_timer();
+        runtime = get_timer();
+        printf("Loop 2: %ld ciclos\n", runtime);
+        
+        /************** LOOP 3 **************/
+        start_timer();
+
+        //e[j] = HD(L[j] + a * sum (mu[i][j]))
+        for(j = 0; j < N; j++) {
+
+            x = L[j] + alpha * sumv[j];
+            est_error[j] = (x < 0) ? 1 : 0;
+
+        }
+        
+        stop_timer();
+        runtime = get_timer();
+        printf("Loop 3: %ld ciclos\n", runtime);
+        
+        /************** LOOP 4 **************/
+        start_timer();
+
+        // Cálculo del síndrome esperado
+        corrected = 1;
+        for (i = 0; i < M; i++) {
+            check[i] = 0;
+            for (j = 0; j < 8; j++) {   //h_lengths en h son siempre 8
+                check[i] ^= est_error[h_indices[i][j]];
+            }
+
+            if (check[i] != S[i]) {
+                corrected = 0;
+            }
+        }
+        
+        stop_timer();
+        runtime = get_timer();
+        printf("Loop 4: %ld ciclos\n", runtime);
+
+        (*it)++;
+    }
+
+    return corrected;
+}
+
+uint8_t logic_permutation(int32_t error[N], int32_t logical_error[N_logic]) {
+
+    int32_t i, j;
+
+    for (i = 0; i < N_logic; ++i) {
+        logical_error[i] = 0;
+        for (j = 0; j < ht_logic_lengths[i]; ++j) {
+            logical_error[i] ^= error[ht_logic_indices[i][j]];
+        }
+    }
+
+    return 0; 
+}
+
+int main() {
+
+    //Genreación de semilla    
+    srand(0);
+    //printf("SEED: %d\n", seed);
+    //srand(time(NULL));
+
+    float alpha = 0.75, p_error = 0.02f;
+    int32_t error[N] = {0}, est_error[N] = {0}, S[M] = {0}, logical_error[N_logic], error_X[N] = {0}, error_Z[N] = {0};
+    float noise[N];
+    int32_t i, j, l, n_iterations = 50, error_rate = 10000, it;
+    uint8_t corrected = 0;
+    int64_t runtime = 0;
+
+    // Inicializar todos los LLRs a 1.0 
+    float L[N];
+    for (int i = 0; i < N; ++i) {
+        L[i] = 1.0f;
+    }
+    
+    for(l=0; l < error_rate; l++) {
+    
+      // ----------------------------
+      // Generación de errores aleatorios (Pauli X, Z, Y)
+      // ----------------------------
+      for (i = 0; i < N; ++i) {
+          
+          est_error[i] = 0;
+          error_X[i] = 0;
+          error_Z[i] = 0;
+          noise[i] = (float)rand() / RAND_MAX;
+
+          if (noise[i] < p_error / 3.0f) {
+              error_X[i] = 1;
+          } else if (noise[i] < 2.0f * p_error / 3.0f) {
+              error_Z[i] = 1;
+          } else if (noise[i] < p_error) {
+              error_X[i] = 1;
+              error_Z[i] = 1;
+          }
+      }
+
+      // Seleccionar qué tipo de error pasar al decodificador (Z)
+      for (i = 0; i < N; ++i) {
+          error[i] = error_Z[i];
+          //error[i] = error_X[i];
+          //error[i] = error_X[i] ^ error_Z[i];
+      }
+
+      //Calcular el Sindrome generado por el error
+      for (i = 0; i < h_M; i++) {
+          S[i] = 0;
+          for (j = 0; j < h_lengths[i]; j++) {
+              S[i] ^= error[h_indices[i][j]];
+          }
+      }
+      
+      it = 0;
+
+      // Ejecutar decodificador
+      //start_timer();
+      corrected = qldcp_minsum(n_iterations, L, alpha, S, est_error, &it);
+      //stop_timer();
+      
+      //runtime = get_timer();
+      
+      if(corrected){
+        printf("%d, %d, %ld\n", l, it, runtime);
+      }else{
+        printf("%d, %d, 0\n", l, it);
+      }
+      
+    }
+    
+    return 0;
+}
